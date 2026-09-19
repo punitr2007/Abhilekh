@@ -29,8 +29,9 @@ import com.abhilekh.app.core.pdf.PdfBoxEngine
 import com.abhilekh.app.core.pdf.PdfPageInput
 import com.abhilekh.app.data.db.DocumentEntity
 import com.abhilekh.app.data.db.PageEntity
+import com.abhilekh.app.ui.screens.DocumentEditorScreen
+import com.abhilekh.app.ui.screens.EditablePage
 import com.abhilekh.app.ui.screens.HomeScreen
-import com.abhilekh.app.ui.screens.ManualRedactionScreen
 import com.abhilekh.app.ui.theme.AbhilekhTheme
 import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
@@ -55,52 +56,73 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
     )
 
     var isProcessing by mutableStateOf(false)
-    var activeRedactionBitmap by mutableStateOf<Bitmap?>(null)
+    var isEditingSession by mutableStateOf(false)
+    var sessionBitmaps = mutableStateListOf<Bitmap>()
+    var defaultSessionTitle by mutableStateOf("")
 
-    fun processScannedPages(pageUris: List<Uri>, onComplete: () -> Unit) {
+    /**
+     * Ingests scanned or picked URIs into the interactive editing studio session.
+     */
+    fun startEditingSessionFromUris(uris: List<Uri>, isAppend: Boolean = false) {
+        viewModelScope.launch {
+            isProcessing = true
+            try {
+                val loadedBitmaps = withContext(Dispatchers.IO) {
+                    uris.mapNotNull { uri ->
+                        app.contentResolver.openInputStream(uri)?.use { stream ->
+                            BitmapFactory.decodeStream(stream)
+                        }?.copy(Bitmap.Config.ARGB_8888, true)
+                    }
+                }
+
+                if (isAppend) {
+                    sessionBitmaps.addAll(loadedBitmaps)
+                } else {
+                    sessionBitmaps.clear()
+                    sessionBitmaps.addAll(loadedBitmaps)
+                    val timeStamp = SimpleDateFormat("ddMMM_HHmm", Locale.getDefault()).format(Date())
+                    defaultSessionTitle = "Scan_$timeStamp"
+                    isEditingSession = true
+                }
+            } finally {
+                isProcessing = false
+            }
+        }
+    }
+
+    /**
+     * Compiles edited pages into dual-layer searchable PDF and saves to Room database.
+     */
+    fun saveEditedSession(docTitle: String, pages: List<EditablePage>, onComplete: () -> Unit) {
         viewModelScope.launch {
             isProcessing = true
             try {
                 val docId = UUID.randomUUID().toString()
                 val docDir = File(app.filesDir, "documents/$docId").apply { mkdirs() }
-                val timeStamp = SimpleDateFormat("ddMMM_HHmm", Locale.getDefault()).format(Date())
-                val docTitle = "Scan_$timeStamp"
 
                 val pdfInputs = mutableListOf<PdfPageInput>()
                 val pageEntities = mutableListOf<PageEntity>()
                 var hasMaskedAadhaar = false
 
-                for ((index, uri) in pageUris.withIndex()) {
-                    val bitmap = withContext(Dispatchers.IO) {
-                        app.contentResolver.openInputStream(uri)?.use {
-                            BitmapFactory.decodeStream(it)
-                        }?.copy(Bitmap.Config.ARGB_8888, true)
-                    } ?: continue
+                for ((index, page) in pages.withIndex()) {
+                    val finalBitmap = page.displayBitmap
 
-                    // 1. Apply Illumination Division Filter
-                    withContext(Dispatchers.Default) {
-                        OpenCVNativeBridge.nativeApplyIlluminationDivision(bitmap)
-                    }
-
-                    // 2. Run On-Device OCR
+                    // Run On-Device OCR on the final edited bitmap
                     val ocrResult = withContext(Dispatchers.Default) {
                         try {
-                            OcrManager.recognizeText(bitmap)
+                            OcrManager.recognizeText(finalBitmap)
                         } catch (_: Exception) {
                             null
                         }
                     }
 
-                    // 3. Global Aadhaar Multi-Signal Check & Auto-Masking
+                    // Global Aadhaar Multi-Signal Check
                     var maskedPlaceholder: String? = null
                     if (ocrResult != null) {
-                        val aadhaarEval = AadhaarMaskingEngine.evaluateAndMask(bitmap, ocrResult)
-                        if (aadhaarEval.isAutoMasked) {
+                        val aadhaarEval = AadhaarMaskingEngine.evaluateAndMask(finalBitmap, ocrResult)
+                        if (aadhaarEval.isAutoMasked || page.isMasked) {
                             hasMaskedAadhaar = true
                             maskedPlaceholder = aadhaarEval.maskedText
-                        } else if (aadhaarEval.requiresManualReview) {
-                            // Surface amber warning & allow manual redaction
-                            activeRedactionBitmap = bitmap
                         }
                     }
 
@@ -108,11 +130,11 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                     val pageFile = File(docDir, "page_${index + 1}.jpg")
                     withContext(Dispatchers.IO) {
                         FileOutputStream(pageFile).use { out ->
-                            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                            finalBitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                         }
                     }
 
-                    pdfInputs.add(PdfPageInput(bitmap, ocrResult, maskedPlaceholder))
+                    pdfInputs.add(PdfPageInput(finalBitmap, ocrResult, maskedPlaceholder))
                     pageEntities.add(
                         PageEntity(
                             id = UUID.randomUUID().toString(),
@@ -120,17 +142,17 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                             pageNumber = index + 1,
                             imagePath = pageFile.absolutePath,
                             thumbPath = pageFile.absolutePath,
-                            width = bitmap.width,
-                            height = bitmap.height,
-                            filterType = "illumination_division",
+                            width = finalBitmap.width,
+                            height = finalBitmap.height,
+                            filterType = page.activeFilter.name.lowercase(),
                             ocrText = ocrResult?.text,
-                            isMasked = maskedPlaceholder != null
+                            isMasked = hasMaskedAadhaar || page.isMasked
                         )
                     )
                 }
 
                 if (pdfInputs.isNotEmpty()) {
-                    // 4. Assemble Dual-Layer Searchable PDF via PDFBox ('3 Tr')
+                    // Assemble Dual-Layer Searchable PDF via PDFBox ('3 Tr')
                     val pdfFile = File(docDir, "$docTitle.pdf")
                     PdfBoxEngine.createSearchablePdf(pdfInputs, pdfFile)
 
@@ -149,6 +171,9 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                     dao.insertDocument(docEntity)
                     dao.insertPages(pageEntities)
                 }
+
+                isEditingSession = false
+                sessionBitmaps.clear()
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -156,6 +181,11 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                 onComplete()
             }
         }
+    }
+
+    fun cancelEditingSession() {
+        sessionBitmaps.clear()
+        isEditingSession = false
     }
 
     fun deleteDocument(doc: DocumentEntity) {
@@ -170,6 +200,8 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var scannerLauncher: ActivityResultLauncher<IntentSenderRequest>
     private lateinit var photoPickerLauncher: ActivityResultLauncher<String>
+    private var isAppendingPages = false
+
     private val viewModel: MainViewModel by viewModels {
         object : androidx.lifecycle.ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
@@ -182,12 +214,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Configure ML Kit Document Scanner Intent Launcher
+        // 1. Configure ML Kit High-Speed & Full Document Scanner
         val scannerOptions = GmsDocumentScannerOptions.Builder()
             .setGalleryImportAllowed(true)
             .setPageLimit(100)
             .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
-            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_BASE) // High-speed continuous auto-capture
             .build()
 
         val scannerClient = GmsDocumentScanning.getClient(scannerOptions)
@@ -199,11 +231,10 @@ class MainActivity : ComponentActivity() {
                 val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
                 val pages = scanResult?.pages?.map { it.imageUri } ?: emptyList()
                 if (pages.isNotEmpty()) {
-                    viewModel.processScannedPages(pages) {
-                        Toast.makeText(this, "Scan processed & searchable PDF created!", Toast.LENGTH_SHORT).show()
-                    }
+                    viewModel.startEditingSessionFromUris(pages, isAppend = isAppendingPages)
                 }
             }
+            isAppendingPages = false
         }
 
         // 2. Configure Photo Picker Launcher ("Create from photos")
@@ -211,10 +242,9 @@ class MainActivity : ComponentActivity() {
             ActivityResultContracts.GetMultipleContents()
         ) { uris ->
             if (uris.isNotEmpty()) {
-                viewModel.processScannedPages(uris) {
-                    Toast.makeText(this, "Imported ${uris.size} photos to PDF!", Toast.LENGTH_SHORT).show()
-                }
+                viewModel.startEditingSessionFromUris(uris, isAppend = isAppendingPages)
             }
+            isAppendingPages = false
         }
 
         setContent {
@@ -224,16 +254,22 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     val docs by viewModel.documents.collectAsState()
-                    val redactionBitmap = viewModel.activeRedactionBitmap
 
-                    if (redactionBitmap != null) {
-                        ManualRedactionScreen(
-                            bitmap = redactionBitmap,
-                            onComplete = { _ ->
-                                viewModel.activeRedactionBitmap = null
+                    if (viewModel.isEditingSession && viewModel.sessionBitmaps.isNotEmpty()) {
+                        DocumentEditorScreen(
+                            initialPages = viewModel.sessionBitmaps.toList(),
+                            initialTitle = viewModel.defaultSessionTitle,
+                            onSavePdf = { title, editedPages ->
+                                viewModel.saveEditedSession(title, editedPages) {
+                                    Toast.makeText(this@MainActivity, "PDF Saved & Indexed!", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            onAddMorePages = {
+                                isAppendingPages = true
+                                launchScanner(scannerClient)
                             },
                             onCancel = {
-                                viewModel.activeRedactionBitmap = null
+                                viewModel.cancelEditingSession()
                             }
                         )
                     } else {
@@ -241,17 +277,11 @@ class MainActivity : ComponentActivity() {
                             HomeScreen(
                                 documents = docs,
                                 onLaunchScanner = {
-                                    scannerClient.getStartScanIntent(this@MainActivity)
-                                        .addOnSuccessListener { intentSender ->
-                                            scannerLauncher.launch(
-                                                IntentSenderRequest.Builder(intentSender).build()
-                                            )
-                                        }
-                                        .addOnFailureListener { e ->
-                                            Toast.makeText(this@MainActivity, "Scanner Error: ${e.message}", Toast.LENGTH_LONG).show()
-                                        }
+                                    isAppendingPages = false
+                                    launchScanner(scannerClient)
                                 },
                                 onImportPhotos = {
+                                    isAppendingPages = false
                                     photoPickerLauncher.launch("image/*")
                                 },
                                 onCombineFiles = {
@@ -277,5 +307,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun launchScanner(scannerClient: com.google.mlkit.vision.documentscanner.GmsDocumentScanner) {
+        scannerClient.getStartScanIntent(this@MainActivity)
+            .addOnSuccessListener { intentSender ->
+                scannerLauncher.launch(
+                    IntentSenderRequest.Builder(intentSender).build()
+                )
+            }
+            .addOnFailureListener { e ->
+                Toast.makeText(this@MainActivity, "Scanner Error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
     }
 }
