@@ -6,8 +6,9 @@
 [![C++17 / NDK](https://img.shields.io/badge/Native-C%2B%2B17%20%7C%20NDK-00599C?logo=c%2B%2B&logoColor=white)](https://developer.android.com/ndk)
 [![Min SDK](https://img.shields.io/badge/Min%20SDK-24%20(Android%207.0)-informational)](https://developer.android.com/about/versions/nougat)
 [![Target SDK](https://img.shields.io/badge/Target%20SDK-35%20(Android%2015)-blue)](https://developer.android.com/about/versions/15)
+[![CI](https://github.com/punitr2007/Abhilekh/actions/workflows/ci.yml/badge.svg)](https://github.com/punitr2007/Abhilekh/actions/workflows/ci.yml)
+[![Release](https://github.com/punitr2007/Abhilekh/actions/workflows/release.yml/badge.svg)](https://github.com/punitr2007/Abhilekh/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen)](android/)
 
 > **Abhilekh** is a sovereign, 100% offline-first document scanner and intelligent document processing engine engineered specifically for the Indian ecosystem. Built using modern native Android (Kotlin 2.1.0 + Jetpack Compose) and a high-performance C++ native image processing pipeline, Abhilekh combines Google ML Kit edge detection and on-device Devanagari OCR with automated Verhoeff-validated Aadhaar redaction, morphological illumination correction, and dual-layer searchable PDF generation.
 
