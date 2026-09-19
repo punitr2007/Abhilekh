@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Abhilekh</string>
+    <string name="scan_document">Scan Document</string>
+    <string name="all_scans">All Scans</string>
+    <string name="id_cards">ID Cards</string>
+    <string name="gst_bills">GST Bills</string>
+    <string name="combine_files">Combine Files</string>
+    <string name="share_whatsapp">Share to WhatsApp</string>
+    <string name="aadhaar_masked">Aadhaar Masked</string>
+    <string name="manual_redact">Manual Redaction</string>
+    <string name="erase_data">Erase All Data</string>
+</resources>

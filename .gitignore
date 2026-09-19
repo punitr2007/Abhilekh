@@ -1,0 +1,48 @@
+# Built application files
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+
+# Gradle files
+.gradle/
+build/
+**/build/
+android/build/
+android/app/build/
+android/.gradle/
+.kotlin/
+**/sessions/
+
+# Local configuration file (contains local SDK paths)
+local.properties
+android/local.properties
+
+# Native build cache
+.cxx/
+android/app/.cxx/
+**/app/.cxx/
+
+# Log files
+*.log
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Signing files
+*.jks
+*.keystore
+
+# Node / JS (if any toolchains are used)
+node_modules/
