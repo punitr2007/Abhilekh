@@ -1,5 +1,5 @@
 # Memory & Architecture Decision Records (ADRs)
-## Project: Abhilekh (अभिलेख) — Sovereign Indian Document Scanner
+## Project: Abhilekh (अभिलेख) — Sovereign Indian Multiplatform Document Scanner
 
 ---
 
@@ -7,68 +7,51 @@
 
 - **Project Code**: `Abhilekh` (अभिलेख)
 - **Repository Location**: `/home/punit/Local_Codebase/Projects/Ideas/Abhilekh`
-- **Core Positioning**: A privacy-first, ultra-fast sovereign document scanner for Android built to serve Indian students, MSMEs, CAs, and lawyers with 100% on-device processing, Aadhaar auto-masking, GST bill capture, and direct WhatsApp sharing.
+- **Core Positioning**: A privacy-first, sovereign cross-platform document scanner built for Indian citizens, students, MSMEs, CAs, and lawyers with 100% on-device processing, Aadhaar auto-masking, GST bill capture, and direct WhatsApp sharing.
 
 ---
 
 ## 2. Architecture Decision Records (ADRs)
 
-### ADR-001: Mobile Framework Selection
-- **Decision**: **Pure Kotlin + Jetpack Compose** for Android-first MVP.
-- **Rationale**: Eliminates JSI/TurboModule bridging overhead. Enables direct zero-copy integration with Android CameraX, Google ML Kit Document Scanner API, and native OpenCV JNI. Aligns with proven Compose experience (BitChord) and the MakeACopy reference architecture.
-- **Status**: Approved & Finalized.
+### ADR-001: Platform Architecture — Kotlin Multiplatform (KMP) with Native UI & Shared C++ Core
+- **Decision**: Kotlin Multiplatform (`commonMain`) for business logic + Native Jetpack Compose (Android) & SwiftUI (iOS) + Shared C++17 Core (`libabhilekh_cv`).
+- **Rationale**: Eliminates duplicate OpenCV filter implementations and prevents math/visual drift. Single source of truth for Verhoeff Aadhaar verification, batch state machines, and thermal throttling.
+- **Status**: Approved & Hardened.
 
-### ADR-002: Computer Vision & Scanner Pipeline
-- **Decision**: **Google Play Services ML Kit Document Scanner API** for base capture, live quad detection, and perspective warping + **Custom OpenCV C++ Illumination Division Filter** for paper enhancement.
-- **Rationale**: ML Kit Document Scanner is maintained by Google (shipped in Google Drive/Pixel Camera), works fully on-device, and requires zero maintenance. Custom OpenCV logic is reserved for Indian paper enhancement where off-the-shelf tools fail.
+### ADR-002: Computer Vision Pipeline & Illumination Division
+- **Decision**: Unified C++17 library compiled for Android (via JNI) and iOS (via Kotlin/Native `cinterop`).
+- **Filter**: Morphological Background Estimation & Illumination Division (`cv::dilate` $\rightarrow$ `cv::medianBlur` $\rightarrow$ `cv::divide` $\rightarrow$ luminance normalization).
 - **Status**: Approved.
 
-### ADR-003: On-Device OCR Strategy
-- **Decision**: **Google ML Kit Text Recognition v2** (bundled English + Devanagari/Hindi).
-- **Rationale**: ML Kit v2 runs 100% on-device at zero network cost, covers English and Hindi/Devanagari with high accuracy, and adds negligible APK overhead. Dedicated regional Indic models (Tamil, Telugu, Bengali) are deferred to Phase 2.
+### ADR-003: Dual-Platform Thermal Governor with API 30+ Fallback
+- **Decision**:
+  - Android 11+ (API 30+): `PowerManager.getThermalHeadroom(30)`.
+  - Android 7.0–10 (API 24–29): `Intent.ACTION_BATTERY_CHANGED` battery temperature monitoring (>42°C).
+  - iOS: `ProcessInfo.processInfo.thermalState` (`.serious` / `.critical`).
+  - Action: Downscale raster inputs to 200 DPI and yield 50ms per page during elevated temperatures.
 - **Status**: Approved.
 
-### ADR-004: Global Aadhaar Masking & Multi-Signal Heuristics
-- **Decision**: Aadhaar detection runs globally across **every page's OCR output regardless of selected capture mode**.
-- **Multi-Signal Heuristics**:
-  - Permissive regex: `\b[2-9]{1}[0-9]{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b`
-  - Verhoeff checksum validation.
-  - Contextual keyword verification ("आधार", "Aadhaar", "UID", "DOB", "Male", "Female", "Government of India").
-- **Fail-Loud Invariant**: If confidence is borderline or checksum fails on a suspected ID, the UI displays an amber warning banner and routes the user to the **Manual Redaction Brush**.
+### ADR-004: Ephemeral Per-Session AES-256-GCM Crypto-Shredding & Deterministic Memory Masking
+- **Decision**: Replace non-binding `System.gc()` with in-place pixel buffer zeroing (`memset(0)`). Temporary cache files are encrypted with an ephemeral in-memory AES-256 key wiped upon PDF generation (guaranteeing flash-safe right-to-erasure).
 - **Status**: Approved.
 
-### ADR-005: PDF Engine & Invisible Text Layer (PDFBox-Android)
-- **Decision**: **Apache PDFBox for Android (`com.tom-roush:pdfbox-android`)** using **PDF Text Rendering Mode 3 (`3 Tr` / `RenderingMode.NEITHER`)**.
-- **Rationale**:
-  - Stock `android.graphics.pdf.PdfDocument` cannot do encryption, password protection, or PDF/A metadata.
-  - iText is AGPL-licensed (risk of license contagion in commercial distribution).
-  - Commercial SDKs (PSPDFKit/Nutrient, Foxit) are costly for a bootstrapped MVP.
-  - PDFBox is Apache 2.0 licensed and provides direct content-stream control.
-  - Text Rendering Mode 3 places glyphs in the PDF text stream for selection/search without visual rendering or alpha compositing (which violates PDF/A-1b).
+### ADR-005: Archival PDF/A-1b Engine & Automated veraPDF CI Verification
+- **Decision**: Dual-layer searchable PDF using Apache PDFBox with Text Rendering Mode 3 (`3 Tr`). Output includes embedded sRGB ICC profile, subsetted fonts, and XMP metadata verified in CI via **veraPDF CLI**.
 - **Status**: Approved.
 
-### ADR-006: DPDP Act 2023 / 2025 Phased Regulatory Alignment
-- **Decision**: On-device processing by default with a user-facing **1-Tap Data Erasure Flow** in Settings.
-- **Context**: DPDP rules were notified on 13 Nov 2025; substantive obligations take effect around May 2027. We establish the privacy architecture today without over-engineering moving regulatory targets.
+### ADR-006: Synthetic Aadhaar Card Benchmark Test Bed
+- **Decision**: Programmatic generation of 1,000 synthetic Aadhaar cards with valid Verhoeff checksums, Devanagari text, and synthetic lighting/noise to verify $>99.5\%$ masking precision without exfiltrating real citizen data.
+- **Status**: Approved.
+
+### ADR-007: Owned Design System Architecture (Compose + SwiftUI)
+- **Decision**: Fully owned UI design tokens (`AbhilekhTokens`) and components (Canvas Crop Overlay, Filter Carousel, Amber Aadhaar HUD) instead of opaque third-party UI packages.
 - **Status**: Approved.
 
 ---
 
-## 3. Algorithm Correction & Technical Notes
-
-| Item | Previous Approach | Corrected Specification |
-|---|---|---|
-| **Enhancement Filter** | "Difference of Gaussians (DoG) Filter" | **Morphological Background Estimation & Illumination Division** (`cv::dilate` $\rightarrow$ `cv::medianBlur` $\rightarrow$ `cv::divide` $\rightarrow$ luminance replacement in YCrCb). |
-| **Searchable PDF Text** | Alpha transparent text (`Color.TRANSPARENT`) | **PDF Text Rendering Mode 3 (`3 Tr`)** via PDFBox content stream. |
-| **PDF Library** | Stock Android `PdfDocument` | **Apache PDFBox for Android** (`com.tom-roush:pdfbox-android`). |
-| **Aadhaar Trigger** | Gated only to "Aadhaar/PAN" tab | **Global OCR Pipeline Scan** on every page + Multi-Signal Heuristics. |
-| **UI Chrome Language** | Full Hindi chrome at MVP | **English Chrome at MVP** with Hindi/English OCR; full Hindi UI chrome in Phase 2. |
-| **Compression Target** | "Guaranteed <500KB" | **Adaptive Iterative Compression** with legibility floor and warning toast if page density exceeds threshold. |
-
----
-
-## 4. Technical Invariants & Core Rules
+## 3. Technical Invariants & Core Rules
 
 1. **Zero Unconsented Data Transmission**: No scan images, thumbnails, or OCR text may ever be uploaded without explicit user confirmation.
 2. **Text Rendering Mode 3 Invariant**: Searchable text layers must use PDF Rendering Mode 3 (`3 Tr`) to ensure universal PDF reader searchability without violating PDF/A-1b rules.
 3. **100% Offline Daily Driver**: The full capture, crop, filter, Aadhaar mask, OCR, and PDF export loop must function without internet connectivity.
+4. **Deterministic Crypto-Shredding**: Session temp cache keys must be zeroed immediately upon PDF compilation or session cancellation.

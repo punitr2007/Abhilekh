@@ -1,8 +1,8 @@
 package com.abhilekh.app.core.masking
 
 /**
- * Official Verhoeff Algorithm Implementation for validating 12-digit Indian Aadhaar Numbers.
- * Dihedral group D5 multiplication table & permutation matrix.
+ * Official Verhoeff Algorithm Implementation for validating and generating 12-digit Indian Aadhaar Numbers.
+ * Dihedral group D5 multiplication table, permutation matrix, and inverse table.
  */
 object VerhoeffAlgorithm {
     private val d = arrayOf(
@@ -28,6 +28,22 @@ object VerhoeffAlgorithm {
         intArrayOf(2, 7, 9, 3, 8, 0, 6, 4, 1, 5),
         intArrayOf(7, 0, 4, 6, 9, 1, 3, 2, 5, 8)
     )
+
+    private val inv = intArrayOf(0, 4, 3, 2, 1, 5, 6, 7, 8, 9)
+
+    /**
+     * Generates the Verhoeff checksum digit for an input numeric string.
+     */
+    fun generateVerhoeff(numStr: String): String {
+        val digits = numStr.filter { it.isDigit() }
+        var c = 0
+        val reversed = digits.reversed()
+        for (i in reversed.indices) {
+            val digit = reversed[i] - '0'
+            c = d[c][p[(i + 1) % 8][digit]]
+        }
+        return inv[c].toString()
+    }
 
     /**
      * Validates that a 12-digit numeric string is a mathematically valid Aadhaar number.
