@@ -15,15 +15,16 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.abhilekh.app.core.cv.FilterMode
 import com.abhilekh.app.core.cv.OpenCVNativeBridge
 import com.abhilekh.app.core.masking.AadhaarMaskingEngine
 import com.abhilekh.app.core.ocr.OcrManager
@@ -54,7 +55,15 @@ import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 
-class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
+// ─── SavedStateHandle keys ────────────────────────────────────────────────────
+private const val KEY_IS_EDITING = "is_editing_session"
+private const val KEY_SESSION_TITLE = "session_title"
+
+class MainViewModel(
+    private val app: AbhilekhApplication,
+    private val savedState: SavedStateHandle
+) : ViewModel() {
+
     private val dao = app.database.documentDao()
     private val thermalMonitor = AndroidThermalMonitor(app)
 
@@ -64,22 +73,130 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
         emptyList()
     )
 
+    // ── Processing state ──────────────────────────────────────────────────────
     var isProcessing by mutableStateOf(false)
-    var isEditingSession by mutableStateOf(false)
-    var sessionBitmaps = mutableStateListOf<Bitmap>()
-    var defaultSessionTitle by mutableStateOf("")
-
-    // Real-Time Progress & Thermal State Tracking
     var progressStep by mutableIntStateOf(0)
     var totalProgressSteps by mutableIntStateOf(0)
     var progressMessage by mutableStateOf("")
     var currentThermalTier by mutableStateOf(ThermalTier.NOMINAL)
 
-    // Ephemeral Session Storage with AES-256-GCM Crypto-Shredding
+    // ── Session flags — persisted via SavedStateHandle across process death ───
+    var isEditingSession by mutableStateOf(savedState.get<Boolean>(KEY_IS_EDITING) ?: false)
+        private set
+
+    var defaultSessionTitle by mutableStateOf(savedState.get<String>(KEY_SESSION_TITLE) ?: "")
+        private set
+
+    /**
+     * Canonical in-session editable pages.
+     * Hoisted here (out of the Composable) so they survive recomposition,
+     * screen rotations, and navigation back-stack changes.
+     */
+    val editablePages = mutableStateListOf<EditablePage>()
+
+    // Raw bitmaps used to build pages on first open — kept separate so that
+    // the ViewModel can rebuild pages if the session was restored from disk.
+    private val sessionRawBitmaps = mutableListOf<Bitmap>()
+
+    // Ephemeral AES-256-GCM encrypted cache dir
     private var currentSessionStorage: EphemeralSessionStorage? = null
+
+    // ── Filter / Rotate (background, not UI thread) ───────────────────────────
+
+    /** isApplyingFilter prevents double-tap races while heavy work is in flight. */
+    var isApplyingFilter by mutableStateOf(false)
+        private set
+
+    /**
+     * Applies [filter] to [pageIndex] (or all pages) on [Dispatchers.Default].
+     * This is the fix for the OOM/ANR filter crash: all bitmap work is now
+     * safely off the main thread.
+     */
+    fun applyFilter(pageIndex: Int, filter: FilterMode, applyToAll: Boolean) {
+        if (isApplyingFilter) return
+        viewModelScope.launch {
+            isApplyingFilter = true
+            try {
+                if (applyToAll) {
+                    for (i in editablePages.indices) {
+                        val p = editablePages[i]
+                        val filtered = withContext(Dispatchers.Default) {
+                            OpenCVNativeBridge.applyFilter(p.rawBitmap, filter)
+                        }
+                        // Eagerly recycle the old display bitmap to help the GC
+                        // reclaim native heap before allocating the next one.
+                        if (p.displayBitmap !== p.rawBitmap) p.displayBitmap.recycle()
+                        editablePages[i] = p.copy(displayBitmap = filtered, activeFilter = filter)
+                    }
+                } else if (pageIndex < editablePages.size) {
+                    val p = editablePages[pageIndex]
+                    val filtered = withContext(Dispatchers.Default) {
+                        OpenCVNativeBridge.applyFilter(p.rawBitmap, filter)
+                    }
+                    if (p.displayBitmap !== p.rawBitmap) p.displayBitmap.recycle()
+                    editablePages[pageIndex] = p.copy(displayBitmap = filtered, activeFilter = filter)
+                }
+            } finally {
+                isApplyingFilter = false
+            }
+        }
+    }
+
+    /**
+     * Rotates the page at [pageIndex] by 90° clockwise on [Dispatchers.Default].
+     * Fixes same OOM risk as the filter path.
+     */
+    fun rotatePage(pageIndex: Int) {
+        if (isApplyingFilter || pageIndex >= editablePages.size) return
+        viewModelScope.launch {
+            isApplyingFilter = true
+            try {
+                val p = editablePages[pageIndex]
+                val rotatedRaw = withContext(Dispatchers.Default) {
+                    OpenCVNativeBridge.rotateBitmap(p.rawBitmap, 90f)
+                }
+                val rotatedDisplay = withContext(Dispatchers.Default) {
+                    OpenCVNativeBridge.applyFilter(rotatedRaw, p.activeFilter)
+                }
+                if (p.displayBitmap !== p.rawBitmap) p.displayBitmap.recycle()
+                editablePages[pageIndex] = p.copy(rawBitmap = rotatedRaw, displayBitmap = rotatedDisplay)
+            } finally {
+                isApplyingFilter = false
+            }
+        }
+    }
+
+    /**
+     * Updates a page after crop or redaction (called from sub-screens).
+     */
+    fun updatePage(pageIndex: Int, updatedPage: EditablePage) {
+        if (pageIndex < editablePages.size) {
+            editablePages[pageIndex] = updatedPage
+        }
+    }
+
+    /**
+     * Removes page at [pageIndex].
+     */
+    fun removePage(pageIndex: Int) {
+        if (pageIndex < editablePages.size) {
+            editablePages.removeAt(pageIndex)
+        }
+    }
+
+    /**
+     * Appends additional pages to the current editing session.
+     */
+    fun appendPages(newPages: List<EditablePage>) {
+        editablePages.addAll(newPages)
+    }
+
+    // ── Session Lifecycle ─────────────────────────────────────────────────────
 
     /**
      * Ingests scanned or picked URIs into the interactive editing studio session.
+     * After loading, immediately runs OCR + Aadhaar detection in the background
+     * and populates [editablePages].
      */
     fun startEditingSessionFromUris(uris: List<Uri>, isAppend: Boolean = false) {
         viewModelScope.launch {
@@ -92,6 +209,8 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                 if (!isAppend) {
                     val sessionDir = File(app.cacheDir, "session_${UUID.randomUUID()}").apply { mkdirs() }
                     currentSessionStorage = EphemeralSessionStorage(sessionDir)
+                    sessionRawBitmaps.clear()
+                    editablePages.clear()
                 }
 
                 val loadedBitmaps = withContext(Dispatchers.IO) {
@@ -100,22 +219,65 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                         app.contentResolver.openInputStream(uri)?.use { stream ->
                             BitmapFactory.decodeStream(stream)
                         }?.copy(Bitmap.Config.ARGB_8888, true)?.also { bmp ->
-                            // Cache encrypted page
                             val byteStream = ByteArrayOutputStream()
                             bmp.compress(Bitmap.CompressFormat.JPEG, 90, byteStream)
-                            currentSessionStorage?.writeEncryptedPage(index, byteStream.toByteArray())
+                            currentSessionStorage?.writeEncryptedPage(
+                                sessionRawBitmaps.size + index,
+                                byteStream.toByteArray()
+                            )
                         }
                     }
                 }
 
+                sessionRawBitmaps.addAll(loadedBitmaps)
+
+                // Build EditablePages with the default filter applied (background)
+                progressMessage = "Applying initial filter..."
+                val newPages = withContext(Dispatchers.Default) {
+                    loadedBitmaps.mapIndexed { idx, bitmap ->
+                        val offset = if (isAppend) editablePages.size else 0
+                        val filtered = OpenCVNativeBridge.applyFilter(bitmap, FilterMode.ILLUMINATION_DIVISION)
+                        EditablePage(
+                            id = "page_${offset + idx}",
+                            rawBitmap = bitmap,
+                            displayBitmap = filtered,
+                            activeFilter = FilterMode.ILLUMINATION_DIVISION
+                        )
+                    }
+                }
+
                 if (isAppend) {
-                    sessionBitmaps.addAll(loadedBitmaps)
+                    editablePages.addAll(newPages)
                 } else {
-                    sessionBitmaps.clear()
-                    sessionBitmaps.addAll(loadedBitmaps)
+                    editablePages.addAll(newPages)
                     val timeStamp = SimpleDateFormat("ddMMM_HHmm", Locale.getDefault()).format(Date())
                     defaultSessionTitle = "Scan_$timeStamp"
+                    savedState[KEY_SESSION_TITLE] = defaultSessionTitle
                     isEditingSession = true
+                    savedState[KEY_IS_EDITING] = true
+                }
+
+                // Background OCR + Aadhaar detection (non-blocking)
+                viewModelScope.launch {
+                    val startOffset = if (isAppend) editablePages.size - newPages.size else 0
+                    withContext(Dispatchers.Default) {
+                        for (i in newPages.indices) {
+                            val idx = startOffset + i
+                            if (idx >= editablePages.size) break
+                            val page = editablePages[idx]
+                            try {
+                                val ocr = OcrManager.recognizeText(page.displayBitmap)
+                                val eval = AadhaarMaskingEngine.evaluateAndMask(page.displayBitmap, ocr)
+                                editablePages[idx] = page.copy(
+                                    isAadhaarDetected = eval.hasAadhaar,
+                                    isAutoMasked = eval.isAutoMasked,
+                                    requiresManualReview = eval.requiresManualReview,
+                                    aadhaarSnippet = eval.rawMatchedText,
+                                    isMasked = eval.isAutoMasked || page.isMasked
+                                )
+                            } catch (_: Exception) {}
+                        }
+                    }
                 }
             } finally {
                 isProcessing = false
@@ -127,10 +289,10 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
      * Compiles edited pages into dual-layer searchable PDF and saves to Room database.
      * Incorporates Thermal Throttling Governor and Ephemeral Crypto-Shredding.
      */
-    fun saveEditedSession(docTitle: String, pages: List<EditablePage>, onComplete: () -> Unit) {
+    fun saveEditedSession(docTitle: String, onComplete: () -> Unit) {
         viewModelScope.launch {
             isProcessing = true
-            totalProgressSteps = pages.size
+            totalProgressSteps = editablePages.size
             progressStep = 0
 
             try {
@@ -141,30 +303,23 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                 val pageEntities = mutableListOf<PageEntity>()
                 var hasMaskedAadhaar = false
 
-                for ((index, page) in pages.withIndex()) {
+                for ((index, page) in editablePages.withIndex()) {
                     progressStep = index + 1
-                    progressMessage = "Enhancing & OCR Page ${index + 1} of ${pages.size}..."
+                    progressMessage = "Enhancing & OCR Page ${index + 1} of ${editablePages.size}..."
 
-                    // 1. Evaluate Thermal State Governor
                     currentThermalTier = thermalMonitor.getCurrentThermalTier()
-                    if (currentThermalTier == ThermalTier.SEVERE) {
-                        delay(150) // Yield coroutine on high thermal headroom
-                    } else if (currentThermalTier == ThermalTier.MODERATE) {
-                        delay(50)
+                    when (currentThermalTier) {
+                        ThermalTier.SEVERE -> delay(150)
+                        ThermalTier.MODERATE -> delay(50)
+                        else -> Unit
                     }
 
                     val finalBitmap = page.displayBitmap
 
-                    // 2. Run On-Device OCR on the final edited bitmap
                     val ocrResult = withContext(Dispatchers.Default) {
-                        try {
-                            OcrManager.recognizeText(finalBitmap)
-                        } catch (_: Exception) {
-                            null
-                        }
+                        try { OcrManager.recognizeText(finalBitmap) } catch (_: Exception) { null }
                     }
 
-                    // 3. Global Aadhaar Multi-Signal Check
                     var maskedPlaceholder: String? = null
                     if (ocrResult != null) {
                         val aadhaarEval = AadhaarMaskingEngine.evaluateAndMask(finalBitmap, ocrResult)
@@ -174,7 +329,6 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                         }
                     }
 
-                    // 4. Save enhanced page bitmap to sandboxed storage
                     val pageFile = File(docDir, "page_${index + 1}.jpg")
                     withContext(Dispatchers.IO) {
                         FileOutputStream(pageFile).use { out ->
@@ -201,7 +355,6 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
 
                 if (pdfInputs.isNotEmpty()) {
                     progressMessage = "Assembling Searchable PDF ('3 Tr')..."
-                    // Assemble Dual-Layer Searchable PDF via PDFBox ('3 Tr')
                     val pdfFile = File(docDir, "$docTitle.pdf")
                     PdfBoxEngine.createSearchablePdf(pdfInputs, pdfFile)
 
@@ -221,12 +374,11 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                     dao.insertPages(pageEntities)
                 }
 
-                // 5. Ephemeral Crypto-Shredding: Shred temporary cache
+                // Ephemeral Crypto-Shredding
                 currentSessionStorage?.cryptoShred()
                 currentSessionStorage = null
 
-                isEditingSession = false
-                sessionBitmaps.clear()
+                clearSession()
             } catch (e: Exception) {
                 e.printStackTrace()
             } finally {
@@ -239,8 +391,16 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
     fun cancelEditingSession() {
         currentSessionStorage?.cryptoShred()
         currentSessionStorage = null
-        sessionBitmaps.clear()
+        clearSession()
+    }
+
+    private fun clearSession() {
+        editablePages.clear()
+        sessionRawBitmaps.clear()
         isEditingSession = false
+        defaultSessionTitle = ""
+        savedState[KEY_IS_EDITING] = false
+        savedState[KEY_SESSION_TITLE] = ""
     }
 
     fun deleteDocument(doc: DocumentEntity) {
@@ -258,23 +418,24 @@ class MainActivity : ComponentActivity() {
     private var isAppendingPages = false
 
     private val viewModel: MainViewModel by viewModels {
-        object : androidx.lifecycle.ViewModelProvider.Factory {
+        object : androidx.lifecycle.AbstractSavedStateViewModelFactory(this, null) {
             @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                return MainViewModel(application as AbhilekhApplication) as T
-            }
+            override fun <T : ViewModel> create(
+                key: String,
+                modelClass: Class<T>,
+                handle: SavedStateHandle
+            ): T = MainViewModel(application as AbhilekhApplication, handle) as T
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Configure ML Kit High-Speed & Full Document Scanner
         val scannerOptions = GmsDocumentScannerOptions.Builder()
             .setGalleryImportAllowed(true)
             .setPageLimit(100)
             .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
-            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_BASE) // High-speed continuous auto-capture
+            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_BASE)
             .build()
 
         val scannerClient = GmsDocumentScanning.getClient(scannerOptions)
@@ -292,7 +453,6 @@ class MainActivity : ComponentActivity() {
             isAppendingPages = false
         }
 
-        // 2. Configure Photo Picker Launcher ("Create from photos")
         photoPickerLauncher = registerForActivityResult(
             ActivityResultContracts.GetMultipleContents()
         ) { uris ->
@@ -310,12 +470,25 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val docs by viewModel.documents.collectAsState()
 
-                    if (viewModel.isEditingSession && viewModel.sessionBitmaps.isNotEmpty()) {
+                    if (viewModel.isEditingSession && viewModel.editablePages.isNotEmpty()) {
                         DocumentEditorScreen(
-                            initialPages = viewModel.sessionBitmaps.toList(),
+                            pages = viewModel.editablePages,
                             initialTitle = viewModel.defaultSessionTitle,
-                            onSavePdf = { title, editedPages ->
-                                viewModel.saveEditedSession(title, editedPages) {
+                            isApplyingFilter = viewModel.isApplyingFilter,
+                            onApplyFilter = { pageIndex, filter, applyToAll ->
+                                viewModel.applyFilter(pageIndex, filter, applyToAll)
+                            },
+                            onRotatePage = { pageIndex ->
+                                viewModel.rotatePage(pageIndex)
+                            },
+                            onUpdatePage = { pageIndex, updatedPage ->
+                                viewModel.updatePage(pageIndex, updatedPage)
+                            },
+                            onRemovePage = { pageIndex ->
+                                viewModel.removePage(pageIndex)
+                            },
+                            onSavePdf = { title ->
+                                viewModel.saveEditedSession(title) {
                                     Toast.makeText(this@MainActivity, "PDF Saved & Indexed!", Toast.LENGTH_SHORT).show()
                                 }
                             },
@@ -347,7 +520,6 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
 
-                            // Dynamic Island / Live Updates Progress Capsule Overlay
                             if (viewModel.isProcessing) {
                                 Box(
                                     modifier = Modifier

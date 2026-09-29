@@ -19,6 +19,7 @@ import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -30,8 +31,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.abhilekh.app.core.cv.FilterMode
 import com.abhilekh.app.core.cv.OpenCVNativeBridge
-import com.abhilekh.app.core.masking.AadhaarMaskingEngine
-import com.abhilekh.app.core.ocr.OcrManager
 import com.abhilekh.app.ui.designsystem.AbhilekhTokens
 import com.abhilekh.app.ui.designsystem.AmberWarningHUD
 import com.abhilekh.app.ui.theme.*
@@ -55,61 +54,28 @@ data class EditablePage(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DocumentEditorScreen(
-    initialPages: List<Bitmap>,
+    // ─── pages is now owned by the ViewModel (SnapshotStateList) ─────────────
+    // This means edits survive recomposition, screen rotation, and nav changes.
+    pages: SnapshotStateList<EditablePage>,
     initialTitle: String,
-    onSavePdf: (title: String, pages: List<EditablePage>) -> Unit,
+    isApplyingFilter: Boolean,
+    onApplyFilter: (pageIndex: Int, filter: FilterMode, applyToAll: Boolean) -> Unit,
+    onRotatePage: (pageIndex: Int) -> Unit,
+    onUpdatePage: (pageIndex: Int, updatedPage: EditablePage) -> Unit,
+    onRemovePage: (pageIndex: Int) -> Unit,
+    onSavePdf: (title: String) -> Unit,
     onAddMorePages: () -> Unit,
     onCancel: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
-    var documentTitle by remember { mutableStateOf(initialTitle) }
+    var documentTitle by remember(initialTitle) { mutableStateOf(initialTitle) }
     var isRenaming by remember { mutableStateOf(false) }
-
-    // Initialize editable pages with default Magic Clean filter applied
-    val pages = remember {
-        mutableStateListOf<EditablePage>().apply {
-            addAll(
-                initialPages.mapIndexed { index, bitmap ->
-                    val filtered = OpenCVNativeBridge.applyFilter(bitmap, FilterMode.ILLUMINATION_DIVISION)
-                    EditablePage(
-                        id = "page_$index",
-                        rawBitmap = bitmap,
-                        displayBitmap = filtered,
-                        activeFilter = FilterMode.ILLUMINATION_DIVISION
-                    )
-                }
-            )
-        }
-    }
-
-    // Launch background OCR & Aadhaar Heuristic Scanning on initial load
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.Default) {
-            for (i in pages.indices) {
-                val page = pages[i]
-                try {
-                    val ocr = OcrManager.recognizeText(page.displayBitmap)
-                    val eval = AadhaarMaskingEngine.evaluateAndMask(page.displayBitmap, ocr)
-                    pages[i] = page.copy(
-                        isAadhaarDetected = eval.hasAadhaar,
-                        isAutoMasked = eval.isAutoMasked,
-                        requiresManualReview = eval.requiresManualReview,
-                        aadhaarSnippet = eval.rawMatchedText,
-                        isMasked = eval.isAutoMasked || page.isMasked
-                    )
-                } catch (_: Exception) {}
-            }
-        }
-    }
-
-    val pagerState = rememberPagerState(pageCount = { pages.size })
-    val currentPageIndex = pagerState.currentPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+    var showFilterSheet by remember { mutableStateOf(false) }
+    var applyFilterToAll by remember { mutableStateOf(false) }
 
     // Active sub-screens
     var croppingPageIndex by remember { mutableStateOf<Int?>(null) }
     var redactingPageIndex by remember { mutableStateOf<Int?>(null) }
-    var showFilterSheet by remember { mutableStateOf(false) }
-    var applyFilterToAll by remember { mutableStateOf(false) }
 
     // Sub-Screen: Interactive Crop & Border Adjustment
     if (croppingPageIndex != null && croppingPageIndex!! < pages.size) {
@@ -118,12 +84,14 @@ fun DocumentEditorScreen(
         CropAdjustmentScreen(
             rawBitmap = page.rawBitmap,
             onComplete = { croppedBitmap ->
-                val newFiltered = OpenCVNativeBridge.applyFilter(croppedBitmap, page.activeFilter)
-                pages[targetIndex] = page.copy(
-                    rawBitmap = croppedBitmap,
-                    displayBitmap = newFiltered
-                )
-                croppingPageIndex = null
+                coroutineScope.launch {
+                    // Apply current filter on the newly cropped bitmap — off-thread
+                    val newFiltered = withContext(Dispatchers.Default) {
+                        OpenCVNativeBridge.applyFilter(croppedBitmap, page.activeFilter)
+                    }
+                    onUpdatePage(targetIndex, page.copy(rawBitmap = croppedBitmap, displayBitmap = newFiltered))
+                    croppingPageIndex = null
+                }
             },
             onCancel = { croppingPageIndex = null }
         )
@@ -137,17 +105,20 @@ fun DocumentEditorScreen(
         ManualRedactionScreen(
             bitmap = page.displayBitmap,
             onComplete = { redactedBitmap ->
-                pages[targetIndex] = page.copy(
+                onUpdatePage(targetIndex, page.copy(
                     displayBitmap = redactedBitmap,
                     isMasked = true,
                     requiresManualReview = false
-                )
+                ))
                 redactingPageIndex = null
             },
             onCancel = { redactingPageIndex = null }
         )
         return
     }
+
+    val pagerState = rememberPagerState(pageCount = { pages.size })
+    val currentPageIndex = pagerState.currentPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
 
     Scaffold(
         topBar = {
@@ -180,7 +151,7 @@ fun DocumentEditorScreen(
                 },
                 actions = {
                     Button(
-                        onClick = { onSavePdf(documentTitle, pages.toList()) },
+                        onClick = { onSavePdf(documentTitle) },
                         colors = ButtonDefaults.buttonColors(containerColor = RoyalBlue),
                         shape = RoundedCornerShape(20.dp),
                         modifier = Modifier.padding(end = 8.dp)
@@ -280,23 +251,16 @@ fun DocumentEditorScreen(
                         EditorActionItem(
                             icon = Icons.Default.AutoFixHigh,
                             label = "Filters",
+                            // Disable tap while a filter is being applied
+                            enabled = !isApplyingFilter,
                             onClick = { showFilterSheet = true }
                         )
 
                         EditorActionItem(
                             icon = Icons.AutoMirrored.Filled.RotateRight,
                             label = "Rotate",
-                            onClick = {
-                                if (currentPageIndex < pages.size) {
-                                    val current = pages[currentPageIndex]
-                                    val rotatedRaw = OpenCVNativeBridge.rotateBitmap(current.rawBitmap, 90f)
-                                    val rotatedDisplay = OpenCVNativeBridge.applyFilter(rotatedRaw, current.activeFilter)
-                                    pages[currentPageIndex] = current.copy(
-                                        rawBitmap = rotatedRaw,
-                                        displayBitmap = rotatedDisplay
-                                    )
-                                }
-                            }
+                            enabled = !isApplyingFilter,
+                            onClick = { onRotatePage(currentPageIndex) }
                         )
 
                         EditorActionItem(
@@ -312,7 +276,7 @@ fun DocumentEditorScreen(
                                 tint = Color(0xFFDC2626),
                                 onClick = {
                                     if (currentPageIndex < pages.size) {
-                                        pages.removeAt(currentPageIndex)
+                                        onRemovePage(currentPageIndex)
                                     }
                                 }
                             )
@@ -322,6 +286,14 @@ fun DocumentEditorScreen(
                             icon = Icons.Default.AddAPhoto,
                             label = "Add",
                             onClick = onAddMorePages
+                        )
+                    }
+
+                    // In-progress indicator while filter is being applied
+                    if (isApplyingFilter) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = RoyalBlue
                         )
                     }
                 }
@@ -393,7 +365,7 @@ fun DocumentEditorScreen(
                             )
                         }
 
-                        // Emerald Masked Badge
+                        // Masked Badge
                         if (page.isMasked || page.isAutoMasked) {
                             Surface(
                                 shape = RoundedCornerShape(12.dp),
@@ -438,7 +410,10 @@ fun DocumentEditorScreen(
                                     redactingPageIndex = currentPageIndex
                                 },
                                 onDismiss = {
-                                    pages[currentPageIndex] = currentPage.copy(dismissedWarning = true)
+                                    onUpdatePage(
+                                        currentPageIndex,
+                                        currentPage.copy(dismissedWarning = true)
+                                    )
                                 }
                             )
                         }
@@ -479,6 +454,19 @@ fun DocumentEditorScreen(
 
     // ─── Filter Selection Bottom Sheet ─────────────────────────────────────────
     if (showFilterSheet) {
+        // Precompute scaled filter preview thumbnails — tiny (100×140) so it's fast
+        // and does not cause OOM. Computed once and cached in a remember map.
+        val filterPreviews = remember(currentPageIndex) {
+            if (pages.isEmpty() || currentPageIndex >= pages.size) return@remember mapOf<FilterMode, Bitmap>()
+            val rawBitmap = pages[currentPageIndex].rawBitmap
+            val thumbW = 100
+            val thumbH = 140
+            val scaledRaw = Bitmap.createScaledBitmap(rawBitmap, thumbW, thumbH, true)
+            FilterMode.values().associateWith { filter ->
+                OpenCVNativeBridge.applyFilter(scaledRaw, filter)
+            }
+        }
+
         ModalBottomSheet(
             onDismissRequest = { showFilterSheet = false }
         ) {
@@ -515,24 +503,9 @@ fun DocumentEditorScreen(
 
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
-                            modifier = Modifier.clickable {
-                                if (applyFilterToAll) {
-                                    for (i in pages.indices) {
-                                        val p = pages[i]
-                                        val filtered = OpenCVNativeBridge.applyFilter(p.rawBitmap, filter)
-                                        pages[i] = p.copy(
-                                            displayBitmap = filtered,
-                                            activeFilter = filter
-                                        )
-                                    }
-                                } else if (currentPageIndex < pages.size) {
-                                    val p = pages[currentPageIndex]
-                                    val filtered = OpenCVNativeBridge.applyFilter(p.rawBitmap, filter)
-                                    pages[currentPageIndex] = p.copy(
-                                        displayBitmap = filtered,
-                                        activeFilter = filter
-                                    )
-                                }
+                            modifier = Modifier.clickable(enabled = !isApplyingFilter) {
+                                // Delegate all bitmap work to the ViewModel (off-thread)
+                                onApplyFilter(currentPageIndex, filter, applyFilterToAll)
                                 showFilterSheet = false
                             }
                         ) {
@@ -548,9 +521,10 @@ fun DocumentEditorScreen(
                                     ),
                                 contentAlignment = Alignment.Center
                             ) {
-                                if (currentPageIndex < pages.size) {
+                                // Show filtered preview thumbnail (not raw)
+                                filterPreviews[filter]?.let { previewBmp ->
                                     Image(
-                                        bitmap = pages[currentPageIndex].rawBitmap.asImageBitmap(),
+                                        bitmap = previewBmp.asImageBitmap(),
                                         contentDescription = filter.displayName,
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier.fillMaxSize()
@@ -578,16 +552,18 @@ private fun EditorActionItem(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
     tint: Color = MaterialTheme.colorScheme.onSurface,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
+    val effectiveTint = if (enabled) tint else tint.copy(alpha = 0.38f)
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
-            .clickable { onClick() }
+            .clickable(enabled = enabled) { onClick() }
             .padding(horizontal = 8.dp, vertical = 4.dp)
     ) {
-        Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(24.dp))
+        Icon(icon, contentDescription = label, tint = effectiveTint, modifier = Modifier.size(24.dp))
         Spacer(modifier = Modifier.height(2.dp))
-        Text(label, fontSize = 11.sp, color = tint, fontWeight = FontWeight.Medium)
+        Text(label, fontSize = 11.sp, color = effectiveTint, fontWeight = FontWeight.Medium)
     }
 }
