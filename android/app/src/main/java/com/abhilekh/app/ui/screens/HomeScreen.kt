@@ -170,7 +170,8 @@ fun HomeScreen(
                     items(filteredDocs, key = { it.id }) { doc ->
                         DocumentCard(
                             document = doc,
-                            onWhatsAppShare = { shareToWhatsApp(context, doc.pdfPath) },
+                            onShare = { shareDocument(context, doc.pdfPath, "Share ${doc.title}") },
+                            onClick = { openDocument(context, doc.pdfPath) },
                             onDelete = { onDeleteDocument(doc) }
                         )
                     }
@@ -183,14 +184,17 @@ fun HomeScreen(
 @Composable
 fun DocumentCard(
     document: DocumentEntity,
-    onWhatsAppShare: () -> Unit,
+    onShare: () -> Unit,
+    onClick: () -> Unit,
     onDelete: () -> Unit
 ) {
     val dateStr = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(document.updatedAt))
     val sizeKb = (document.fileSizeBytes / 1024).coerceAtLeast(1)
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -262,12 +266,12 @@ fun DocumentCard(
                 }
             }
 
-            // Quick WhatsApp Action
-            IconButton(onClick = onWhatsAppShare) {
+            // Universal Share Action
+            IconButton(onClick = onShare) {
                 Icon(
                     Icons.Default.Share,
                     contentDescription = "Share",
-                    tint = WhatsAppGreen
+                    tint = RoyalBlue
                 )
             }
 
@@ -282,7 +286,7 @@ fun DocumentCard(
     }
 }
 
-fun shareToWhatsApp(context: Context, pdfPath: String) {
+fun shareDocument(context: Context, pdfPath: String, chooserTitle: String = "Share Document") {
     val file = File(pdfPath)
     if (!file.exists()) return
 
@@ -292,22 +296,43 @@ fun shareToWhatsApp(context: Context, pdfPath: String) {
         file
     )
 
-    val intent = Intent(Intent.ACTION_SEND).apply {
+    val shareIntent = Intent(Intent.ACTION_SEND).apply {
         type = "application/pdf"
         putExtra(Intent.EXTRA_STREAM, uri)
-        setPackage("com.whatsapp")
+        putExtra(Intent.EXTRA_SUBJECT, file.nameWithoutExtension)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
 
+    val chooser = Intent.createChooser(shareIntent, chooserTitle).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
     try {
-        context.startActivity(intent)
-    } catch (_: Exception) {
-        // Fallback to standard share sheet if WhatsApp is not installed
-        val fallbackIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/pdf"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        context.startActivity(Intent.createChooser(fallbackIntent, "Share Document"))
+        context.startActivity(chooser)
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+}
+
+fun openDocument(context: Context, pdfPath: String) {
+    val file = File(pdfPath)
+    if (!file.exists()) return
+
+    val uri: Uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file
+    )
+
+    val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/pdf")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+
+    try {
+        context.startActivity(Intent.createChooser(viewIntent, "Open PDF"))
+    } catch (e: Exception) {
+        e.printStackTrace()
     }
 }
