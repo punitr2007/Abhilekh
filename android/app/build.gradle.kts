@@ -98,6 +98,12 @@ dependencies {
     // Apache PDFBox for Android
     implementation(libs.pdfbox.android)
 
+    // CameraX — High-Speed Scan Mode
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
 

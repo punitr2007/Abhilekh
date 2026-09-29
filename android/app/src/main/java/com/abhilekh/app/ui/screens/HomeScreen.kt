@@ -3,11 +3,15 @@ package com.abhilekh.app.ui.screens
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.animation.*
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -17,7 +21,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -35,6 +41,7 @@ import java.util.*
 fun HomeScreen(
     documents: List<DocumentEntity>,
     onLaunchScanner: () -> Unit,
+    onHighSpeedScan: () -> Unit,
     onImportPhotos: () -> Unit,
     onCombineFiles: () -> Unit,
     onDeleteDocument: (DocumentEntity) -> Unit
@@ -78,12 +85,11 @@ fun HomeScreen(
             )
         },
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = onLaunchScanner,
-                icon = { Icon(Icons.Default.CameraAlt, contentDescription = "Scan") },
-                text = { Text("Scan Doc", fontWeight = FontWeight.Bold) },
-                containerColor = RoyalBlue,
-                contentColor = Color.White
+            SpeedDialFab(
+                onStandardScan = onLaunchScanner,
+                onHighSpeedScan = onHighSpeedScan,
+                onImportPhotos = onImportPhotos,
+                onCombineFiles = onCombineFiles
             )
         }
     ) { paddingValues ->
@@ -334,5 +340,121 @@ fun openDocument(context: Context, pdfPath: String) {
         context.startActivity(Intent.createChooser(viewIntent, "Open PDF"))
     } catch (e: Exception) {
         e.printStackTrace()
+    }
+}
+
+// ─── Speed Dial FAB ───────────────────────────────────────────────────────────
+
+@Composable
+fun SpeedDialFab(
+    onStandardScan: () -> Unit,
+    onHighSpeedScan: () -> Unit,
+    onImportPhotos: () -> Unit,
+    onCombineFiles: () -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val rotation by animateFloatAsState(
+        targetValue = if (expanded) 45f else 0f,
+        animationSpec = tween(250),
+        label = "fab_rotation"
+    )
+
+    Column(horizontalAlignment = Alignment.End) {
+        // Speed-dial items (visible when expanded)
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(tween(200)) + slideInVertically(tween(200)) { it / 2 },
+            exit = fadeOut(tween(150)) + slideOutVertically(tween(150)) { it / 2 }
+        ) {
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                SpeedDialItem(
+                    label = "Combine files",
+                    icon = Icons.AutoMirrored.Filled.MergeType,
+                    onClick = { expanded = false; onCombineFiles() }
+                )
+                SpeedDialItem(
+                    label = "Import from photos",
+                    icon = Icons.Default.AddPhotoAlternate,
+                    onClick = { expanded = false; onImportPhotos() }
+                )
+                SpeedDialItem(
+                    label = "High-speed scan",
+                    icon = Icons.Default.Speed,
+                    onClick = { expanded = false; onHighSpeedScan() },
+                    highlight = true
+                )
+                SpeedDialItem(
+                    label = "Standard scan",
+                    icon = Icons.Default.CameraAlt,
+                    onClick = { expanded = false; onStandardScan() }
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+        }
+
+        // Primary FAB (+ → ×)
+        FloatingActionButton(
+            onClick = { expanded = !expanded },
+            containerColor = RoyalBlue,
+            contentColor = Color.White,
+            shape = CircleShape
+        ) {
+            Icon(
+                imageVector = Icons.Default.Add,
+                contentDescription = if (expanded) "Close" else "Scan actions",
+                modifier = Modifier.rotate(rotation)
+            )
+        }
+    }
+
+    // Dismiss overlay when expanded
+    if (expanded) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .clickable(onClick = { expanded = false })
+        )
+    }
+}
+
+@Composable
+private fun SpeedDialItem(
+    label: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    highlight: Boolean = false
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.End,
+        modifier = Modifier.padding(end = 4.dp)
+    ) {
+        // Label chip
+        Surface(
+            shape = RoundedCornerShape(8.dp),
+            color = if (highlight) RoyalBlue.copy(alpha = 0.95f) else Color(0xFF1A1A2E).copy(alpha = 0.92f),
+            shadowElevation = 4.dp
+        ) {
+            Text(
+                text = label,
+                color = Color.White,
+                fontWeight = if (highlight) FontWeight.Bold else FontWeight.Normal,
+                fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        // Mini FAB
+        SmallFloatingActionButton(
+            onClick = onClick,
+            containerColor = if (highlight) RoyalBlue else Color(0xFF2C2C3E),
+            contentColor = Color.White,
+            shape = CircleShape
+        ) {
+            Icon(icon, contentDescription = label, modifier = Modifier.size(20.dp))
+        }
     }
 }

@@ -59,6 +59,13 @@ import java.util.*
 private const val KEY_IS_EDITING = "is_editing_session"
 private const val KEY_SESSION_TITLE = "session_title"
 
+// ─── App navigation screen sealed class ──────────────────────────────────────
+sealed class AppScreen {
+    object Home : AppScreen()
+    object HighSpeedCapture : AppScreen()
+    object DocumentEditor : AppScreen()
+}
+
 class MainViewModel(
     private val app: AbhilekhApplication,
     private val savedState: SavedStateHandle
@@ -189,6 +196,93 @@ class MainViewModel(
      */
     fun appendPages(newPages: List<EditablePage>) {
         editablePages.addAll(newPages)
+    }
+
+    // ── High-Speed Capture queue ──────────────────────────────────────────────
+
+    /** Bitmaps captured during HighSpeedScanScreen — not yet processed */
+    val capturedRawQueue = mutableStateListOf<Bitmap>()
+
+    /**
+     * Called by HighSpeedScanScreen for every auto/manual captured page.
+     * Keeps the raw bitmap in queue until the user taps "Done".
+     */
+    fun appendRawCapture(bitmap: Bitmap) {
+        capturedRawQueue.add(bitmap)
+    }
+
+    /**
+     * Converts the captured bitmap queue into a full editing session.
+     * Called when the user taps "Done" in HighSpeedScanScreen.
+     * Bitmaps are ingested directly (no URI decoding needed — already in memory).
+     */
+    fun beginEditPhaseFromQueue() {
+        if (capturedRawQueue.isEmpty()) return
+        viewModelScope.launch {
+            isProcessing = true
+            progressMessage = "Preparing pages..."
+            progressStep = 0
+            totalProgressSteps = capturedRawQueue.size
+
+            try {
+                val sessionDir = File(app.cacheDir, "session_${UUID.randomUUID()}").apply { mkdirs() }
+                currentSessionStorage = EphemeralSessionStorage(sessionDir)
+                sessionRawBitmaps.clear()
+                editablePages.clear()
+
+                // Process each captured bitmap in the background
+                progressMessage = "Applying filter to ${capturedRawQueue.size} pages..."
+                val newPages = withContext(Dispatchers.Default) {
+                    capturedRawQueue.mapIndexed { idx, bitmap ->
+                        progressStep = idx + 1
+                        val filtered = OpenCVNativeBridge.applyFilter(bitmap, FilterMode.ILLUMINATION_DIVISION)
+                        sessionRawBitmaps.add(bitmap)
+                        // Encrypt + cache to ephemeral session
+                        val byteStream = ByteArrayOutputStream()
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 90, byteStream)
+                        currentSessionStorage?.writeEncryptedPage(idx, byteStream.toByteArray())
+                        EditablePage(
+                            id = "page_$idx",
+                            rawBitmap = bitmap,
+                            displayBitmap = filtered,
+                            activeFilter = FilterMode.ILLUMINATION_DIVISION
+                        )
+                    }
+                }
+
+                editablePages.addAll(newPages)
+                capturedRawQueue.clear()
+
+                val timeStamp = SimpleDateFormat("ddMMM_HHmm", Locale.getDefault()).format(Date())
+                defaultSessionTitle = "HighSpeed_$timeStamp"
+                savedState[KEY_SESSION_TITLE] = defaultSessionTitle
+                isEditingSession = true
+                savedState[KEY_IS_EDITING] = true
+
+                // Background OCR + Aadhaar detection
+                viewModelScope.launch {
+                    withContext(Dispatchers.Default) {
+                        for (i in newPages.indices) {
+                            if (i >= editablePages.size) break
+                            val page = editablePages[i]
+                            try {
+                                val ocr = OcrManager.recognizeText(page.displayBitmap)
+                                val eval = AadhaarMaskingEngine.evaluateAndMask(page.displayBitmap, ocr)
+                                editablePages[i] = page.copy(
+                                    isAadhaarDetected = eval.hasAadhaar,
+                                    isAutoMasked = eval.isAutoMasked,
+                                    requiresManualReview = eval.requiresManualReview,
+                                    aadhaarSnippet = eval.rawMatchedText,
+                                    isMasked = eval.isAutoMasked || page.isMasked
+                                )
+                            } catch (_: Exception) {}
+                        }
+                    }
+                }
+            } finally {
+                isProcessing = false
+            }
+        }
     }
 
     // ── Session Lifecycle ─────────────────────────────────────────────────────
@@ -469,71 +563,108 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     val docs by viewModel.documents.collectAsState()
-
-                    if (viewModel.isEditingSession && viewModel.editablePages.isNotEmpty()) {
-                        DocumentEditorScreen(
-                            pages = viewModel.editablePages,
-                            initialTitle = viewModel.defaultSessionTitle,
-                            isApplyingFilter = viewModel.isApplyingFilter,
-                            onApplyFilter = { pageIndex, filter, applyToAll ->
-                                viewModel.applyFilter(pageIndex, filter, applyToAll)
-                            },
-                            onRotatePage = { pageIndex ->
-                                viewModel.rotatePage(pageIndex)
-                            },
-                            onUpdatePage = { pageIndex, updatedPage ->
-                                viewModel.updatePage(pageIndex, updatedPage)
-                            },
-                            onRemovePage = { pageIndex ->
-                                viewModel.removePage(pageIndex)
-                            },
-                            onSavePdf = { title ->
-                                viewModel.saveEditedSession(title) {
-                                    Toast.makeText(this@MainActivity, "PDF Saved & Indexed!", Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            onAddMorePages = {
-                                isAppendingPages = true
-                                launchScanner(scannerClient)
-                            },
-                            onCancel = {
-                                viewModel.cancelEditingSession()
-                            }
+                    // Screen state — drives navigation
+                    var currentScreen by remember {
+                        mutableStateOf<AppScreen>(
+                            if (viewModel.isEditingSession && viewModel.editablePages.isNotEmpty())
+                                AppScreen.DocumentEditor
+                            else AppScreen.Home
                         )
-                    } else {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            HomeScreen(
-                                documents = docs,
-                                onLaunchScanner = {
-                                    isAppendingPages = false
+                    }
+
+                    when (currentScreen) {
+                        // ── Document Editor ───────────────────────────────────
+                        AppScreen.DocumentEditor -> {
+                            DocumentEditorScreen(
+                                pages = viewModel.editablePages,
+                                initialTitle = viewModel.defaultSessionTitle,
+                                isApplyingFilter = viewModel.isApplyingFilter,
+                                onApplyFilter = { pageIndex, filter, applyToAll ->
+                                    viewModel.applyFilter(pageIndex, filter, applyToAll)
+                                },
+                                onRotatePage = { pageIndex ->
+                                    viewModel.rotatePage(pageIndex)
+                                },
+                                onUpdatePage = { pageIndex, updatedPage ->
+                                    viewModel.updatePage(pageIndex, updatedPage)
+                                },
+                                onRemovePage = { pageIndex ->
+                                    viewModel.removePage(pageIndex)
+                                },
+                                onSavePdf = { title ->
+                                    viewModel.saveEditedSession(title) {
+                                        Toast.makeText(this@MainActivity, "PDF Saved & Indexed!", Toast.LENGTH_SHORT).show()
+                                        currentScreen = AppScreen.Home
+                                    }
+                                },
+                                onAddMorePages = {
+                                    isAppendingPages = true
                                     launchScanner(scannerClient)
                                 },
-                                onImportPhotos = {
-                                    isAppendingPages = false
-                                    photoPickerLauncher.launch("image/*")
-                                },
-                                onCombineFiles = {
-                                    Toast.makeText(this@MainActivity, "Select documents to merge into one PDF", Toast.LENGTH_SHORT).show()
-                                },
-                                onDeleteDocument = { doc ->
-                                    viewModel.deleteDocument(doc)
+                                onCancel = {
+                                    viewModel.cancelEditingSession()
+                                    currentScreen = AppScreen.Home
                                 }
                             )
+                        }
 
-                            if (viewModel.isProcessing) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(top = 36.dp),
-                                    contentAlignment = Alignment.TopCenter
-                                ) {
-                                    DynamicProgressCapsule(
-                                        isVisible = true,
-                                        currentStep = viewModel.progressStep,
-                                        totalSteps = viewModel.totalProgressSteps,
-                                        statusMessage = viewModel.progressMessage,
-                                        thermalTier = viewModel.currentThermalTier
-                                    )
+                        // ── High-Speed Capture ────────────────────────────────
+                        AppScreen.HighSpeedCapture -> {
+                            com.abhilekh.app.ui.screens.HighSpeedScanScreen(
+                                onCapture = { bmp -> viewModel.appendRawCapture(bmp) },
+                                onFinish = {
+                                    viewModel.beginEditPhaseFromQueue()
+                                    currentScreen = AppScreen.DocumentEditor
+                                },
+                                onBack = { currentScreen = AppScreen.Home }
+                            )
+                        }
+
+                        // ── Home ──────────────────────────────────────────────
+                        AppScreen.Home -> {
+                            // Sync: if ViewModel restores an editing session on process restart, jump to editor
+                            LaunchedEffect(viewModel.isEditingSession, viewModel.editablePages.size) {
+                                if (viewModel.isEditingSession && viewModel.editablePages.isNotEmpty()) {
+                                    currentScreen = AppScreen.DocumentEditor
+                                }
+                            }
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                HomeScreen(
+                                    documents = docs,
+                                    onLaunchScanner = {
+                                        isAppendingPages = false
+                                        launchScanner(scannerClient)
+                                    },
+                                    onHighSpeedScan = {
+                                        currentScreen = AppScreen.HighSpeedCapture
+                                    },
+                                    onImportPhotos = {
+                                        isAppendingPages = false
+                                        photoPickerLauncher.launch("image/*")
+                                    },
+                                    onCombineFiles = {
+                                        Toast.makeText(this@MainActivity, "Select documents to merge into one PDF", Toast.LENGTH_SHORT).show()
+                                    },
+                                    onDeleteDocument = { doc ->
+                                        viewModel.deleteDocument(doc)
+                                    }
+                                )
+
+                                if (viewModel.isProcessing) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(top = 36.dp),
+                                        contentAlignment = Alignment.TopCenter
+                                    ) {
+                                        DynamicProgressCapsule(
+                                            isVisible = true,
+                                            currentStep = viewModel.progressStep,
+                                            totalSteps = viewModel.totalProgressSteps,
+                                            statusMessage = viewModel.progressMessage,
+                                            thermalTier = viewModel.currentThermalTier
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -555,3 +686,4 @@ class MainActivity : ComponentActivity() {
             }
     }
 }
+
