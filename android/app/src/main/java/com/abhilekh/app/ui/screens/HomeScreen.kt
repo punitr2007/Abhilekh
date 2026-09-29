@@ -8,6 +8,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -49,6 +50,8 @@ fun HomeScreen(
     val context = LocalContext.current
     var searchQuery by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("All") }
+    // Hoisted here so the full-screen dismiss scrim can be rendered in the same Box
+    var speedDialExpanded by remember { mutableStateOf(false) }
 
     val filteredDocs = documents.filter {
         it.title.contains(searchQuery, ignoreCase = true)
@@ -83,106 +86,135 @@ fun HomeScreen(
                     containerColor = MaterialTheme.colorScheme.surface
                 )
             )
-        },
-        floatingActionButton = {
-            SpeedDialFab(
-                onStandardScan = onLaunchScanner,
-                onHighSpeedScan = onHighSpeedScan,
-                onImportPhotos = onImportPhotos,
-                onCombineFiles = onCombineFiles
-            )
         }
+        // No floatingActionButton slot — SpeedDial is an overlay in the content Box below
     ) { paddingValues ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
-                .background(MaterialTheme.colorScheme.background)
         ) {
-            // Search Bar
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
+            // ── Main content ──────────────────────────────────────────────────
+            Column(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                placeholder = { Text("Search by title or OCR text...") },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { searchQuery = "" }) {
-                            Icon(Icons.Default.Close, contentDescription = "Clear")
-                        }
-                    }
-                },
-                shape = RoundedCornerShape(12.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                    focusedContainerColor = MaterialTheme.colorScheme.surface
-                )
-            )
-
-            // Category Filter Pills
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
             ) {
-                listOf("All", "ID Cards", "GST Bills", "Notes").forEach { category ->
-                    FilterChip(
-                        selected = selectedCategory == category,
-                        onClick = { selectedCategory = category },
-                        label = { Text(category) }
+                // Search Bar
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    placeholder = { Text("Search by title or OCR text...") },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear")
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                        focusedContainerColor = MaterialTheme.colorScheme.surface
                     )
-                }
-                Spacer(modifier = Modifier.weight(1f))
-                IconButton(onClick = onImportPhotos) {
-                    Icon(Icons.Default.AddPhotoAlternate, contentDescription = "Import from Photos", tint = Slate700)
-                }
-            }
+                )
 
-            // Documents List
-            if (filteredDocs.isEmpty()) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
+                // Category Filter Pills
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            Icons.Default.DocumentScanner,
-                            contentDescription = null,
-                            modifier = Modifier.size(64.dp),
-                            tint = Slate500
+                    listOf("All", "ID Cards", "GST Bills", "Notes").forEach { category ->
+                        FilterChip(
+                            selected = selectedCategory == category,
+                            onClick = { selectedCategory = category },
+                            label = { Text(category) }
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "No documents scanned yet",
-                            color = Slate500,
-                            fontWeight = FontWeight.Medium
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Button(onClick = onLaunchScanner) {
-                            Text("Start Scanning")
+                    }
+                    Spacer(modifier = Modifier.weight(1f))
+                    IconButton(onClick = onImportPhotos) {
+                        Icon(Icons.Default.AddPhotoAlternate, contentDescription = "Import from Photos", tint = Slate700)
+                    }
+                }
+
+                // Documents List
+                if (filteredDocs.isEmpty()) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                Icons.Default.DocumentScanner,
+                                contentDescription = null,
+                                modifier = Modifier.size(64.dp),
+                                tint = Slate500
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "No documents scanned yet",
+                                color = Slate500,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Button(onClick = onLaunchScanner) {
+                                Text("Start Scanning")
+                            }
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(filteredDocs, key = { it.id }) { doc ->
+                            DocumentCard(
+                                document = doc,
+                                onShare = { shareDocument(context, doc.pdfPath, "Share ${doc.title}") },
+                                onClick = { openDocument(context, doc.pdfPath) },
+                                onDelete = { onDeleteDocument(doc) }
+                            )
                         }
                     }
                 }
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    items(filteredDocs, key = { it.id }) { doc ->
-                        DocumentCard(
-                            document = doc,
-                            onShare = { shareDocument(context, doc.pdfPath, "Share ${doc.title}") },
-                            onClick = { openDocument(context, doc.pdfPath) },
-                            onDelete = { onDeleteDocument(doc) }
-                        )
-                    }
-                }
             }
+
+            // ── Speed Dial dismiss scrim (drawn above content, below FAB items) ─
+            AnimatedVisibility(
+                visible = speedDialExpanded,
+                enter = fadeIn(tween(150)),
+                exit = fadeOut(tween(100))
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.35f))
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { speedDialExpanded = false }
+                )
+            }
+
+            // ── Speed Dial FAB (always top of z-order, bottom-end of Box) ─────
+            SpeedDialFab(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(bottom = 16.dp, end = 16.dp),
+                expanded = speedDialExpanded,
+                onToggle = { speedDialExpanded = !speedDialExpanded },
+                onStandardScan = { speedDialExpanded = false; onLaunchScanner() },
+                onHighSpeedScan = { speedDialExpanded = false; onHighSpeedScan() },
+                onImportPhotos = { speedDialExpanded = false; onImportPhotos() },
+                onCombineFiles = { speedDialExpanded = false; onCombineFiles() }
+            )
         }
     }
 }
@@ -347,57 +379,64 @@ fun openDocument(context: Context, pdfPath: String) {
 
 @Composable
 fun SpeedDialFab(
+    modifier: Modifier = Modifier,
+    expanded: Boolean,
+    onToggle: () -> Unit,
     onStandardScan: () -> Unit,
     onHighSpeedScan: () -> Unit,
     onImportPhotos: () -> Unit,
     onCombineFiles: () -> Unit
 ) {
-    var expanded by remember { mutableStateOf(false) }
     val rotation by animateFloatAsState(
         targetValue = if (expanded) 45f else 0f,
         animationSpec = tween(250),
         label = "fab_rotation"
     )
 
-    Column(horizontalAlignment = Alignment.End) {
+    // Column grows upward: items first (above), FAB last (below)
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.End,
+        verticalArrangement = Arrangement.Bottom
+    ) {
         // Speed-dial items (visible when expanded)
         AnimatedVisibility(
             visible = expanded,
-            enter = fadeIn(tween(200)) + slideInVertically(tween(200)) { it / 2 },
-            exit = fadeOut(tween(150)) + slideOutVertically(tween(150)) { it / 2 }
+            enter = fadeIn(tween(180)) + slideInVertically(tween(180)) { it / 2 },
+            exit = fadeOut(tween(120)) + slideOutVertically(tween(120)) { it / 2 }
         ) {
             Column(
                 horizontalAlignment = Alignment.End,
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.padding(bottom = 12.dp)
             ) {
                 SpeedDialItem(
                     label = "Combine files",
                     icon = Icons.AutoMirrored.Filled.MergeType,
-                    onClick = { expanded = false; onCombineFiles() }
+                    onClick = onCombineFiles
                 )
                 SpeedDialItem(
                     label = "Import from photos",
                     icon = Icons.Default.AddPhotoAlternate,
-                    onClick = { expanded = false; onImportPhotos() }
+                    onClick = onImportPhotos
                 )
                 SpeedDialItem(
                     label = "High-speed scan",
                     icon = Icons.Default.Speed,
-                    onClick = { expanded = false; onHighSpeedScan() },
+                    onClick = onHighSpeedScan,
                     highlight = true
                 )
                 SpeedDialItem(
                     label = "Standard scan",
                     icon = Icons.Default.CameraAlt,
-                    onClick = { expanded = false; onStandardScan() }
+                    onClick = onStandardScan
                 )
-                Spacer(Modifier.height(4.dp))
             }
         }
 
         // Primary FAB (+ → ×)
         FloatingActionButton(
-            onClick = { expanded = !expanded },
+            onClick = onToggle,
             containerColor = RoyalBlue,
             contentColor = Color.White,
             shape = CircleShape
@@ -408,15 +447,6 @@ fun SpeedDialFab(
                 modifier = Modifier.rotate(rotation)
             )
         }
-    }
-
-    // Dismiss overlay when expanded
-    if (expanded) {
-        Box(
-            Modifier
-                .fillMaxSize()
-                .clickable(onClick = { expanded = false })
-        )
     }
 }
 
