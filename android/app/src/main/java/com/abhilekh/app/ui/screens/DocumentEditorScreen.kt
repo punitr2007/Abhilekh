@@ -30,8 +30,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.abhilekh.app.core.cv.FilterMode
 import com.abhilekh.app.core.cv.OpenCVNativeBridge
+import com.abhilekh.app.core.masking.AadhaarMaskingEngine
+import com.abhilekh.app.core.ocr.OcrManager
+import com.abhilekh.app.ui.designsystem.AbhilekhTokens
+import com.abhilekh.app.ui.designsystem.AmberWarningHUD
 import com.abhilekh.app.ui.theme.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class EditablePage(
     val id: String,
@@ -39,6 +45,10 @@ data class EditablePage(
     var displayBitmap: Bitmap,
     var activeFilter: FilterMode = FilterMode.ILLUMINATION_DIVISION,
     var isAadhaarDetected: Boolean = false,
+    var isAutoMasked: Boolean = false,
+    var requiresManualReview: Boolean = false,
+    var aadhaarSnippet: String? = null,
+    var dismissedWarning: Boolean = false,
     var isMasked: Boolean = false
 )
 
@@ -69,6 +79,26 @@ fun DocumentEditorScreen(
                     )
                 }
             )
+        }
+    }
+
+    // Launch background OCR & Aadhaar Heuristic Scanning on initial load
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.Default) {
+            for (i in pages.indices) {
+                val page = pages[i]
+                try {
+                    val ocr = OcrManager.recognizeText(page.displayBitmap)
+                    val eval = AadhaarMaskingEngine.evaluateAndMask(page.displayBitmap, ocr)
+                    pages[i] = page.copy(
+                        isAadhaarDetected = eval.hasAadhaar,
+                        isAutoMasked = eval.isAutoMasked,
+                        requiresManualReview = eval.requiresManualReview,
+                        aadhaarSnippet = eval.rawMatchedText,
+                        isMasked = eval.isAutoMasked || page.isMasked
+                    )
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -109,7 +139,8 @@ fun DocumentEditorScreen(
             onComplete = { redactedBitmap ->
                 pages[targetIndex] = page.copy(
                     displayBitmap = redactedBitmap,
-                    isMasked = true
+                    isMasked = true,
+                    requiresManualReview = false
                 )
                 redactingPageIndex = null
             },
@@ -232,7 +263,7 @@ fun DocumentEditorScreen(
                         HorizontalDivider(color = Slate100)
                     }
 
-                    // ─── Adobe Scan Style Bottom Actions Bar ───────────────────
+                    // ─── Bottom Actions Bar ────────────────────────────────────
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -359,6 +390,56 @@ fun DocumentEditorScreen(
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+
+                        // Emerald Masked Badge
+                        if (page.isMasked || page.isAutoMasked) {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = EmeraldTrust.copy(alpha = 0.95f),
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(12.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Shield,
+                                        contentDescription = "Masked",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("MASKED", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ─── Fail-Loud Amber Warning Alert HUD ─────────────────────────
+                if (currentPageIndex < pages.size) {
+                    val currentPage = pages[currentPageIndex]
+                    if (currentPage.requiresManualReview && !currentPage.dismissedWarning) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .align(Alignment.TopCenter)
+                                .padding(top = 8.dp)
+                        ) {
+                            AmberWarningHUD(
+                                isVisible = true,
+                                pageNumber = currentPageIndex + 1,
+                                detectedTextSnippet = currentPage.aadhaarSnippet,
+                                onReviewClick = {
+                                    redactingPageIndex = currentPageIndex
+                                },
+                                onDismiss = {
+                                    pages[currentPageIndex] = currentPage.copy(dismissedWarning = true)
+                                }
                             )
                         }
                     }

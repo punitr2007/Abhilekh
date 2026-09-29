@@ -14,12 +14,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.abhilekh.app.core.cv.OpenCVNativeBridge
@@ -27,8 +29,12 @@ import com.abhilekh.app.core.masking.AadhaarMaskingEngine
 import com.abhilekh.app.core.ocr.OcrManager
 import com.abhilekh.app.core.pdf.PdfBoxEngine
 import com.abhilekh.app.core.pdf.PdfPageInput
+import com.abhilekh.app.core.storage.EphemeralSessionStorage
+import com.abhilekh.app.core.thermal.AndroidThermalMonitor
+import com.abhilekh.app.core.thermal.ThermalTier
 import com.abhilekh.app.data.db.DocumentEntity
 import com.abhilekh.app.data.db.PageEntity
+import com.abhilekh.app.ui.designsystem.DynamicProgressCapsule
 import com.abhilekh.app.ui.screens.DocumentEditorScreen
 import com.abhilekh.app.ui.screens.EditablePage
 import com.abhilekh.app.ui.screens.HomeScreen
@@ -37,10 +43,12 @@ import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
 import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -48,6 +56,7 @@ import java.util.*
 
 class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
     private val dao = app.database.documentDao()
+    private val thermalMonitor = AndroidThermalMonitor(app)
 
     val documents = dao.getAllDocuments().stateIn(
         viewModelScope,
@@ -60,18 +69,42 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
     var sessionBitmaps = mutableStateListOf<Bitmap>()
     var defaultSessionTitle by mutableStateOf("")
 
+    // Real-Time Progress & Thermal State Tracking
+    var progressStep by mutableIntStateOf(0)
+    var totalProgressSteps by mutableIntStateOf(0)
+    var progressMessage by mutableStateOf("")
+    var currentThermalTier by mutableStateOf(ThermalTier.NOMINAL)
+
+    // Ephemeral Session Storage with AES-256-GCM Crypto-Shredding
+    private var currentSessionStorage: EphemeralSessionStorage? = null
+
     /**
      * Ingests scanned or picked URIs into the interactive editing studio session.
      */
     fun startEditingSessionFromUris(uris: List<Uri>, isAppend: Boolean = false) {
         viewModelScope.launch {
             isProcessing = true
+            progressMessage = "Ingesting scan pages..."
+            progressStep = 0
+            totalProgressSteps = uris.size
+
             try {
+                if (!isAppend) {
+                    val sessionDir = File(app.cacheDir, "session_${UUID.randomUUID()}").apply { mkdirs() }
+                    currentSessionStorage = EphemeralSessionStorage(sessionDir)
+                }
+
                 val loadedBitmaps = withContext(Dispatchers.IO) {
-                    uris.mapNotNull { uri ->
+                    uris.mapIndexedNotNull { index, uri ->
+                        progressStep = index + 1
                         app.contentResolver.openInputStream(uri)?.use { stream ->
                             BitmapFactory.decodeStream(stream)
-                        }?.copy(Bitmap.Config.ARGB_8888, true)
+                        }?.copy(Bitmap.Config.ARGB_8888, true)?.also { bmp ->
+                            // Cache encrypted page
+                            val byteStream = ByteArrayOutputStream()
+                            bmp.compress(Bitmap.CompressFormat.JPEG, 90, byteStream)
+                            currentSessionStorage?.writeEncryptedPage(index, byteStream.toByteArray())
+                        }
                     }
                 }
 
@@ -92,10 +125,14 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
 
     /**
      * Compiles edited pages into dual-layer searchable PDF and saves to Room database.
+     * Incorporates Thermal Throttling Governor and Ephemeral Crypto-Shredding.
      */
     fun saveEditedSession(docTitle: String, pages: List<EditablePage>, onComplete: () -> Unit) {
         viewModelScope.launch {
             isProcessing = true
+            totalProgressSteps = pages.size
+            progressStep = 0
+
             try {
                 val docId = UUID.randomUUID().toString()
                 val docDir = File(app.filesDir, "documents/$docId").apply { mkdirs() }
@@ -105,9 +142,20 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                 var hasMaskedAadhaar = false
 
                 for ((index, page) in pages.withIndex()) {
+                    progressStep = index + 1
+                    progressMessage = "Enhancing & OCR Page ${index + 1} of ${pages.size}..."
+
+                    // 1. Evaluate Thermal State Governor
+                    currentThermalTier = thermalMonitor.getCurrentThermalTier()
+                    if (currentThermalTier == ThermalTier.SEVERE) {
+                        delay(150) // Yield coroutine on high thermal headroom
+                    } else if (currentThermalTier == ThermalTier.MODERATE) {
+                        delay(50)
+                    }
+
                     val finalBitmap = page.displayBitmap
 
-                    // Run On-Device OCR on the final edited bitmap
+                    // 2. Run On-Device OCR on the final edited bitmap
                     val ocrResult = withContext(Dispatchers.Default) {
                         try {
                             OcrManager.recognizeText(finalBitmap)
@@ -116,7 +164,7 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                         }
                     }
 
-                    // Global Aadhaar Multi-Signal Check
+                    // 3. Global Aadhaar Multi-Signal Check
                     var maskedPlaceholder: String? = null
                     if (ocrResult != null) {
                         val aadhaarEval = AadhaarMaskingEngine.evaluateAndMask(finalBitmap, ocrResult)
@@ -126,7 +174,7 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                         }
                     }
 
-                    // Save enhanced page bitmap to sandboxed storage
+                    // 4. Save enhanced page bitmap to sandboxed storage
                     val pageFile = File(docDir, "page_${index + 1}.jpg")
                     withContext(Dispatchers.IO) {
                         FileOutputStream(pageFile).use { out ->
@@ -152,6 +200,7 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                 }
 
                 if (pdfInputs.isNotEmpty()) {
+                    progressMessage = "Assembling Searchable PDF ('3 Tr')..."
                     // Assemble Dual-Layer Searchable PDF via PDFBox ('3 Tr')
                     val pdfFile = File(docDir, "$docTitle.pdf")
                     PdfBoxEngine.createSearchablePdf(pdfInputs, pdfFile)
@@ -172,6 +221,10 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
                     dao.insertPages(pageEntities)
                 }
 
+                // 5. Ephemeral Crypto-Shredding: Shred temporary cache
+                currentSessionStorage?.cryptoShred()
+                currentSessionStorage = null
+
                 isEditingSession = false
                 sessionBitmaps.clear()
             } catch (e: Exception) {
@@ -184,6 +237,8 @@ class MainViewModel(private val app: AbhilekhApplication) : ViewModel() {
     }
 
     fun cancelEditingSession() {
+        currentSessionStorage?.cryptoShred()
+        currentSessionStorage = null
         sessionBitmaps.clear()
         isEditingSession = false
     }
@@ -292,14 +347,21 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
 
+                            // Dynamic Island / Live Updates Progress Capsule Overlay
                             if (viewModel.isProcessing) {
-                                Surface(
-                                    modifier = Modifier.fillMaxSize(),
-                                    color = MaterialTheme.colorScheme.background.copy(alpha = 0.7f)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(top = 36.dp),
+                                    contentAlignment = Alignment.TopCenter
                                 ) {
-                                    Box(contentAlignment = Alignment.Center) {
-                                        CircularProgressIndicator()
-                                    }
+                                    DynamicProgressCapsule(
+                                        isVisible = true,
+                                        currentStep = viewModel.progressStep,
+                                        totalSteps = viewModel.totalProgressSteps,
+                                        statusMessage = viewModel.progressMessage,
+                                        thermalTier = viewModel.currentThermalTier
+                                    )
                                 }
                             }
                         }
